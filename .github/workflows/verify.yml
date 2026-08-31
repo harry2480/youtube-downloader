@@ -1,9 +1,8 @@
 name: Verify
 
 on:
+  # push トリガーは持たない。PR[main] で同一コミットを検証済みで、完全な重複だった。
   pull_request:
-    branches: [main]
-  push:
     branches: [main]
 
 concurrency:

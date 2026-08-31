@@ -1,8 +1,10 @@
 name: Coverage
 
 on:
+  # push は既定ブランチ(develop)のみ。Codecov の比較ベースラインを更新するために必要。
+  # main への push は develop で検証済みの同一ツリーなので落とす。
   push:
-    branches: [develop, main]
+    branches: [develop]
   pull_request:
     branches: [develop, main]
 
