@@ -1,51 +1,37 @@
 name: CI
 
 on:
-  push:
-    branches: ['**']
+  # push トリガーは持たない。develop/main への push は直前の pull_request 検証と
+  # 同一コミットの再実行にすぎず、追加のガード価値がゼロ。
+  #
+  # 変更判定はトリガーレベルの paths で行う。以前は detect-changes ジョブで git diff
+  # して後続ジョブを if でスキップしていたが、それでは runner が起動するため
+  # 「実処理ゼロの PR でも detect-changes + ci-status で2分課金」されていた
+  # （実測 2026-08: 課金64分に対し実処理は5分未満）。paths ならワークフロー自体が
+  # キューイングされず課金ゼロになる。
   pull_request:
     branches: ['**']
+    paths:
+      - 'app/**'
+      - '.github/workflows/ci.yml'
+
+# 同一 PR で新しい push があれば古い実行をキャンセル
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  detect-changes:
-    name: 変更ファイルを検出
+  # 型チェック・ビルド・テストと E2E を単一ジョブに統合した。
+  # ジョブ単位の分単位切り上げ課金を減らすのに加え、分割していた頃は両ジョブが
+  # それぞれ checkout と pnpm install をやり直していた（同じ処理の二重払い）。
+  ci:
+    name: 型チェック・ビルド・テスト・E2E
     runs-on: ubuntu-latest
-    outputs:
-      app-changed: ${{ steps.changes.outputs.app }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: 変更ファイルを確認
-        id: changes
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch origin "${{ github.event.pull_request.base.ref }}" --no-tags
-            BASE="origin/${{ github.event.pull_request.base.ref }}"
-            HEAD="HEAD"
-          else
-            BASE="${{ github.event.before }}"
-            HEAD="${{ github.event.after }}"
-
-            if [ "$BASE" = "0000000000000000000000000000000000000000" ] || [ -z "$BASE" ]; then
-              BASE="origin/develop"
-            elif ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-              echo "⚠️ BASE ($BASE) が存在しません（force push の可能性）。origin/develop にフォールバック"
-              BASE="origin/develop"
-            fi
-          fi
-
-          APP_CHANGED=$(git diff --name-only "$BASE" "$HEAD" | grep -q "^app/" && echo "true" || echo "false")
-
-          echo "app=$APP_CHANGED" >> $GITHUB_OUTPUT
-          echo "app-changed: $APP_CHANGED"
-
-  typecheck-build-test:
-    name: 型チェック・ビルド・テスト
-    needs: detect-changes
-    if: needs.detect-changes.outputs.app-changed == 'true'
-    runs-on: ubuntu-latest
+    # 既定は 6 時間。E2E がハングした場合に無駄な課金を防ぐ
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: app
@@ -53,8 +39,6 @@ jobs:
     steps:
       - name: コードをチェックアウト
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: pnpm をセットアップ
         uses: pnpm/action-setup@v4
@@ -85,35 +69,14 @@ jobs:
           VITE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.VITE_SUPABASE_SERVICE_ROLE_KEY || 'placeholder-key' }}
           VITE_GITHUB_TOKEN: ${{ secrets.VITE_GITHUB_TOKEN || '' }}
 
-  e2e-tests:
-    name: E2Eテスト（Playwright）
-    needs: detect-changes
-    if: needs.detect-changes.outputs.app-changed == 'true'
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: app
-    steps:
-      - name: コードをチェックアウト
-        uses: actions/checkout@v4
-
-      - name: pnpm をセットアップ
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
-      - name: Node.js をセットアップ（pnpm キャッシュ付き）
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'pnpm'
-          cache-dependency-path: app/pnpm-lock.yaml
-
-      - name: 依存関係をインストール
-        run: pnpm install --frozen-lockfile
-
+      # ⚠️ --with-deps を付けない。あれは apt で OS の共有ライブラリと CJK フォント一式を
+      #    Ubuntu アーカイブから毎回取り直す。ミラーが遅い時間帯には数分〜十数分かかり、
+      #    E2E 本体（数十秒）よりはるかに長い。ubuntu-latest のランナー画像には Chromium の
+      #    実行に必要な共有ライブラリが含まれているため、ブラウザ本体の取得だけで足りる。
+      #    ランナー画像から共有ライブラリが削られた場合は --with-deps に戻すのではなく、
+      #    不足しているライブラリだけを apt で入れること（フォントを巻き込まない）。
       - name: Playwright ブラウザをインストール
-        run: pnpm exec playwright install --with-deps chromium
+        run: pnpm exec playwright install chromium
 
       - name: E2Eテストを実行
         run: pnpm test:e2e
@@ -129,27 +92,3 @@ jobs:
           name: playwright-report
           path: app/playwright-report/
           retention-days: 7
-
-  ci-status:
-    name: CI ステータス確認
-    needs: [detect-changes, typecheck-build-test, e2e-tests]
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - name: CI 結果を確認
-        run: |
-          echo "app-changed: ${{ needs.detect-changes.outputs.app-changed }}"
-
-          if [ "${{ needs.detect-changes.outputs.app-changed }}" = "true" ]; then
-            if [ "${{ needs.typecheck-build-test.result }}" != "success" ]; then
-              echo "❌ app CI failed (typecheck/build/test)"
-              exit 1
-            fi
-            if [ "${{ needs.e2e-tests.result }}" != "success" ]; then
-              echo "❌ e2e CI failed"
-              exit 1
-            fi
-            echo "✅ app CI passed"
-          else
-            echo "⊘ app に変更なし（スキップ）"
-          fi
